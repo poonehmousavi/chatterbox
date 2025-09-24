@@ -4,6 +4,7 @@ from pathlib import Path
 import librosa
 import torch
 import perth
+import pickle
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
@@ -115,6 +116,7 @@ class ChatterboxTTS:
         tokenizer: EnTokenizer,
         device: str,
         conds: Conditionals = None,
+        emo_dir_path: str = None,
     ):
         self.sr = S3GEN_SR  # sample rate of synthesized audio
         self.t3 = t3
@@ -124,6 +126,9 @@ class ChatterboxTTS:
         self.device = device
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
+        if emo_dir_path is not None:
+            self.emo_dirs = pickle.load(open('../all_emo_dirs.pkl', 'rb'))
+
 
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
@@ -165,7 +170,7 @@ class ChatterboxTTS:
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
     @classmethod
-    def from_pretrained(cls, device) -> 'ChatterboxTTS':
+    def from_pretrained(cls, device, emo_dir_path) -> 'ChatterboxTTS':
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -179,7 +184,33 @@ class ChatterboxTTS:
 
         return cls.from_local(Path(local_path).parent, device)
 
-    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+    def get_spk_emb(self, wav_fpath):
+        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        # Voice-encoder speaker embedding
+        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
+        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+        return ve_embed
+    
+    def get_edited_emb(self, source_emb, speaker_pairs: list[tuple[str, str]], strength = 0.3, emotion_desc='neutral', emotion_strategy='predefined'):
+        if emotion_strategy == 'predefined':
+            emo_dir = self.emo_dirs[emotion_desc]
+        else:
+            speaker_pair_embs = [
+                (self.get_spk_emb(neutral_audio_path), 
+                self.get_spk_emb(emotional_audio_path)) for neutral_audio_path, emotional_audio_path in speaker_pairs
+                ]
+            emo_dirs = [emotional_emb - neutral_emb for neutral_emb, emotional_emb in speaker_pair_embs]
+            emo_dirs = [emo_dir / torch.linalg.norm(emo_dir, dim=-1, keepdim=True) for emo_dir in emo_dirs]
+
+            emo_dir = sum(emo_dirs) / len(emo_dirs)
+            emo_dir = emo_dir / torch.linalg.norm(emo_dir, dim=-1, keepdim=True)
+
+         #set strength of emotion control
+        edited_emb = source_emb + strength * torch.tensor(emo_dir)
+        return edited_emb
+    
+    def prepare_conditionals(self, wav_fpath, exaggeration=0.5,emotion_strategy=None, emotion_strength=0.0, speaker_pairs: list[tuple[str, str]] = None, emotion_desc='neutral'):
         ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
@@ -198,6 +229,9 @@ class ChatterboxTTS:
         ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
         ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
 
+        if emotion_strength > 0 and (speaker_pairs is not None or emotion_strategy == "predefined"):
+            ve_embed = self.get_edited_emb(ve_embed, speaker_pairs, strength=emotion_strength, emotion_strategy=emotion_strategy,emotion_desc=emotion_desc)
+
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
@@ -215,9 +249,16 @@ class ChatterboxTTS:
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
+        # preferred correct spelling
+        emotion_strategy = None,
+        emotion_strength=0.0,
+        # allow legacy misspelling for callers that still use it
+        speaker_pairs: list[tuple[str, str]] = None,
+        emotion_desc= None
     ):
+        # If caller used the old misspelling, prefer its value
         if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration,emotion_strategy= emotion_strategy, emotion_strength=emotion_strength, speaker_pairs=speaker_pairs,emotion_desc=emotion_desc)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
